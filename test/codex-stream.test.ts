@@ -1199,6 +1199,52 @@ describe("mid-convo effort streams", () => {
 });
 
 describe("loadCliproxyCodexStreams", () => {
+	it("streams with bundled reasoning, Fast mode, and a custom provider ID", async () => {
+		const streams = await loadCliproxyCodexStreams(["custom-cpa"], {
+			protocolSource: "bundled",
+			shouldUseFast: () => true,
+		});
+		const captured: CapturedRequest[] = [];
+		const model = { ...midConvoModel(true), provider: "custom-cpa" };
+		const context = { messages: [systemMessage(), userMessage("first")] };
+		const first = await streams
+			.streamSimple(model, context, {
+				apiKey: "sk-proxy-key",
+				transport: "sse",
+				reasoning: "low",
+				fetch: cannedSseFetch(captured),
+			} as any)
+			.result();
+		expect(first.errorMessage).toBeUndefined();
+		expect(first.provider).toBe("custom-cpa");
+		expect(first.api).toBe("cliproxyapi-codex-responses");
+		expect(first.content).toMatchObject([{ type: "text", text: "reply 1" }]);
+		expect(first.usage.totalTokens).toBe(15);
+		expect(captured[0].body.reasoning.effort).toBe("low");
+		expect(captured[0].body.service_tier).toBe("priority");
+
+		const second = await streams
+			.streamSimple(
+				model,
+				{
+					messages: [...context.messages, first, userMessage("second")],
+				},
+				{
+					apiKey: "sk-proxy-key",
+					transport: "sse",
+					reasoning: "high",
+					fetch: cannedSseFetch(captured),
+				} as any,
+			)
+			.result();
+		expect(second.errorMessage).toBeUndefined();
+		expect(second.providerThinkingLevel).toBe("high");
+		expect(captured[1].body.reasoning.effort).toBe("low");
+		expect(configurationUpdates(captured[1].body)).toEqual(["high"]);
+		expect(wireUserItemIndex(captured[1].body, "second")).toBe(configurationUpdateIndices(captured[1].body)[0] + 1);
+		streams.closeOpenAICodexWebSocketSessions();
+	});
+
 	it("still loads the patched module from the installed package graph", async () => {
 		const streams = await loadCliproxyCodexStreams(["cliproxyapi"]);
 		expect(typeof streams.streamSimple).toBe("function");

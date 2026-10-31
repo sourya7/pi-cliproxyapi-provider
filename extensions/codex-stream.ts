@@ -7,9 +7,9 @@
  * - provider id(s) are added to CODEX_TOOL_CALL_PROVIDERS for tool-call id handling
  * - model/message api id uses cliproxyapi-codex-responses
  *
- * The patched module is derived at runtime from the installed
- * @earendil-works/pi-ai openai-codex-responses implementation so we track
- * upstream protocol fixes without vendoring 1200+ lines.
+ * Prefer patching the host's installed pi-ai module. Compiled hosts (including
+ * Nix's binary Pi package) have no physical JS module, so use the self-contained
+ * build-time bundle in that case. Neither path modifies the host installation.
  */
 
 import { createHash } from "node:crypto";
@@ -41,6 +41,8 @@ export type CliproxyCodexStreams = {
 
 export interface CliproxyCodexStreamOptions {
 	shouldUseFast?: (model: Model<Api>) => boolean;
+	/** Defaults to CLIPROXYAPI_CODEX_SOURCE or auto. Bundled supports binary-only hosts. */
+	protocolSource?: "auto" | "host" | "bundled";
 }
 
 type PayloadHook = NonNullable<SimpleStreamOptions["onPayload"]>;
@@ -1191,11 +1193,34 @@ export function resolveOriginalCodexModulePath(options: ResolveOriginalCodexModu
 	throw new Error(`Cannot resolve openai-codex-responses.js (tried: ${candidates.join(", ") || "none"})`);
 }
 
-export async function loadCliproxyCodexStreams(
-	providerIds: string[] = ["cliproxyapi"],
-	options: CliproxyCodexStreamOptions = {},
-): Promise<CliproxyCodexStreams> {
-	const { path: originalPath } = resolveOriginalCodexModulePath();
+interface CodexProtocolModule {
+	streamSimple: CliproxyCodexStreamSimple;
+	stream: CliproxyCodexStreamSimple;
+	closeOpenAICodexWebSocketSessions?: CloseCodexWebSocketSessions;
+}
+
+async function loadCodexProtocol(providerIds: string[], options: CliproxyCodexStreamOptions) {
+	const source = options.protocolSource ?? process.env.CLIPROXYAPI_CODEX_SOURCE ?? "auto";
+	if (source !== "auto" && source !== "host" && source !== "bundled") {
+		throw new Error("CLIPROXYAPI_CODEX_SOURCE must be auto, host, or bundled");
+	}
+
+	let originalPath: string | undefined;
+	if (source !== "bundled") {
+		try {
+			originalPath = resolveOriginalCodexModulePath().path;
+		} catch (error) {
+			if (source === "host") throw error;
+			// A compiled host exposes pi-ai virtually, without a physical JS tree.
+			// Only discovery failure triggers fallback; host patch/import errors surface.
+		}
+	}
+	if (!originalPath) {
+		const mod = await import("./vendor/codex-fallback.mjs");
+		mod.configureFallbackProviderIds(providerIds);
+		return { mod: mod as CodexProtocolModule, ...mod.fallbackMetadata };
+	}
+
 	const originalSource = readFileSync(originalPath, "utf8");
 
 	// The shared converter only honors configurationUpdateEffort on pi >=1.3.0.
@@ -1219,12 +1244,23 @@ export async function loadCliproxyCodexStreams(
 		writePatchedModuleCache(outPath, patched, originalPath);
 	}
 
-	const mod = (await import(pathToFileURL(outPath).href)) as {
-		streamSimple: CliproxyCodexStreamSimple;
-		stream: CliproxyCodexStreamSimple;
-		closeOpenAICodexWebSocketSessions?: CloseCodexWebSocketSessions;
+	const mod = (await import(pathToFileURL(outPath).href)) as CodexProtocolModule;
+	return {
+		mod,
+		supportsConfigurationUpdate,
+		supportsTranscript: supportsTranscriptSource(originalSource),
+		nativeMidConvoEffort: hasNativeMidConvoEffort(originalSource),
 	};
+}
 
+export async function loadCliproxyCodexStreams(
+	providerIds: string[] = ["cliproxyapi"],
+	options: CliproxyCodexStreamOptions = {},
+): Promise<CliproxyCodexStreams> {
+	const { mod, supportsConfigurationUpdate, supportsTranscript, nativeMidConvoEffort } = await loadCodexProtocol(
+		providerIds,
+		options,
+	);
 	if (typeof mod.streamSimple !== "function" || typeof mod.stream !== "function") {
 		throw new Error("patched openai-codex-responses module missing streamSimple/stream exports");
 	}
@@ -1240,7 +1276,6 @@ export async function loadCliproxyCodexStreams(
 					);
 				};
 
-	const supportsTranscript = supportsTranscriptSource(originalSource);
 	const adaptContext = (context: Context): Context => adaptContextForModule(context, supportsTranscript);
 
 	const adaptModel = (model: Model<Api>): Model<Api> => {
@@ -1254,7 +1289,6 @@ export async function loadCliproxyCodexStreams(
 	// When the host adapter implements mid-convo effort natively, its placement
 	// follows pi's converter layout; reshape payloads to the documented layout
 	// in the wrapper instead of inside the patched module.
-	const nativeMidConvoEffort = hasNativeMidConvoEffort(originalSource);
 	const adaptOptions = (streamOptions?: SimpleStreamOptions): SimpleStreamOptions | undefined => {
 		if (!nativeMidConvoEffort) {
 			return streamOptions;

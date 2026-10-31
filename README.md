@@ -27,6 +27,45 @@ pi install /absolute/path/to/pi-cliproxyapi-provider
 pi -e /absolute/path/to/pi-cliproxyapi-provider
 ```
 
+## Binary Pi / NixOS support (fork)
+
+This fork supports compiled Pi distributions, including binary-only Nix packages
+that contain no physical `openai-codex-responses.js` file. By default the provider
+patches the host module when available; if module discovery fails, it loads the
+checked-in, self-contained Codex bundle instead. Git installs need no build step
+or separately installed Pi dependencies.
+
+Install this fork rather than the upstream package (remove the upstream package
+first if it is already installed, to avoid loading two copies):
+
+```bash
+pi install git:github.com/sourya7/pi-cliproxyapi-provider@dev
+```
+
+`CLIPROXYAPI_CODEX_SOURCE` controls adapter selection:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` (default) | Prefer host JS; use the bundle only when discovery fails |
+| `bundled` | Always use the self-contained bundle |
+| `host` | Require host JS; fail if it cannot be located |
+
+Host patch/import failures are not silently masked by fallback. The bundled
+adapter is pinned to pi-ai **1.3.0**; unlike host mode, it does not automatically
+inherit protocol updates from an upgraded Pi installation. Its dependencies and
+license notices are included under `extensions/vendor/`. Maintainers rebuild it
+with `npm run build:codex-fallback` after intentionally updating the pinned
+`@earendil-works/pi-ai` development dependency. Commit the generated bundle so Git
+installs work without development dependencies.
+
+For PiChat local runtimes, Emacs must pass any source-selection override to Pi:
+
+```elisp
+(setenv "CLIPROXYAPI_CODEX_SOURCE" "bundled")
+```
+
+Restart the runtime afterward. Normally no override is necessary.
+
 ## Login-style setup (recommended)
 
 This plugin needs both **baseUrl** and **apiKey**. pi's built-in `/login` only supports multi-field prompts on the account/OAuth path, so CLIProxyAPI appears under **Sign in with an account** (not API key).
