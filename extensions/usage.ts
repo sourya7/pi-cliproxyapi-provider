@@ -7,6 +7,8 @@
  *   passive `X-Codex-*` signals the proxy records on every request.
  * - OpenCode Go: the plugin's API key from `/config`, forwarded by the proxy to
  *   `https://opencode.ai/zen/go/v1/usage`.
+ * - Claude: the `Anthropic-Ratelimit-Unified-*` signals the proxy records on
+ *   every Claude request. There is no live source, so data ages between requests.
  *
  * Requires CLIPROXYAPI_MANAGEMENT_KEY. Without it the extension stays inactive.
  * Reported windows are account-wide allowances, not this session's consumption;
@@ -17,7 +19,8 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil
 import { resolveConnection, resolveEndpoints, resolveIdentity } from "./lib.ts";
 
 export const MANAGEMENT_KEY_ENV = "CLIPROXYAPI_MANAGEMENT_KEY";
-const STATUS_KEY = "cliproxyapi-usage";
+// PiChat routes this conventional key into its header rather than the transcript.
+const STATUS_KEY = "usage";
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 /** Minimum age before an event-driven refresh makes another upstream call. */
 const LIVE_MIN_AGE_MS = 60 * 1000;
@@ -25,7 +28,7 @@ const REQUEST_TIMEOUT_MS = 15 * 1000;
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 
-export type Upstream = "codex" | "opencode-go";
+export type Upstream = "codex" | "opencode-go" | "claude";
 
 export interface UsageWindow {
 	label: string;
@@ -76,6 +79,7 @@ export function upstreamForModel(modelId: string, ownedBy: string | undefined): 
 	const owner = ownedBy?.toLowerCase();
 	if (owner === "opencode-go" || (!owner && modelId.toLowerCase().startsWith("opencode-go/"))) return "opencode-go";
 	if (owner === "openai") return "codex";
+	if (owner === "anthropic") return "claude";
 	return undefined;
 }
 
@@ -182,6 +186,52 @@ export function parseCodexSignals(quota: unknown): UsageReport | undefined {
 	};
 }
 
+const CLAUDE_WINDOWS = [
+	["5h", "5h"],
+	["7d", "wk"],
+] as const;
+
+/**
+ * Normalize the `Anthropic-Ratelimit-Unified-*` headers CLIProxyAPI records on
+ * the Claude credential. Utilization is a 0-1 fraction; resets are Unix seconds.
+ */
+export function parseClaudeSignals(quota: unknown): UsageReport | undefined {
+	const observation = asObject(quota);
+	const raw = asObject(observation?.signals);
+	if (!raw) return undefined;
+	const signals = new Map<string, string>();
+	for (const [key, value] of Object.entries(raw)) {
+		if (typeof value === "string") signals.set(key.toLowerCase(), value);
+	}
+	const prefix = "anthropic-ratelimit-unified-";
+	const windows: UsageWindow[] = [];
+	const notes: string[] = [];
+	for (const [key, label] of CLAUDE_WINDOWS) {
+		const utilization = asNumber(signals.get(`${prefix}${key}-utilization`));
+		if (utilization === undefined) continue;
+		const resetsAt = asNumber(signals.get(`${prefix}${key}-reset`));
+		windows.push({
+			label,
+			usedPercent: utilization * 100,
+			...(resetsAt !== undefined ? { resetsAt } : {}),
+		});
+		const status = signals.get(`${prefix}${key}-status`);
+		if (status && status !== "allowed") notes.push(`${label} window status: ${status}`);
+	}
+	if (windows.length === 0) return undefined;
+	const overage = signals.get(`${prefix}overage-status`);
+	// Overage is normally disabled; only mention it when it can actually apply.
+	if (overage && overage !== "rejected") notes.push(`Overage: ${overage}`);
+	const observedAt = Date.parse(asString(observation?.observed_at) ?? "");
+	return {
+		upstream: "claude",
+		windows,
+		notes,
+		observedAt: Number.isNaN(observedAt) ? Date.now() : observedAt,
+		source: "passive",
+	};
+}
+
 const OPENCODE_WINDOWS = [
 	["rolling", "roll"],
 	["weekly", "wk"],
@@ -243,7 +293,8 @@ export function findOpenCodeKey(config: unknown, modelId: string): string {
 	return keys[0]!;
 }
 
-const UPSTREAM_LABEL: Record<Upstream, string> = { codex: "codex", "opencode-go": "go" };
+const UPSTREAM_LABEL: Record<Upstream, string> = { codex: "codex", "opencode-go": "go", claude: "claude" };
+const UPSTREAM_NAME: Record<Upstream, string> = { codex: "Codex", "opencode-go": "OpenCode Go", claude: "Claude" };
 
 /** Compact status: remaining percentage per window, e.g. `codex 80% 5h · 8% wk`. */
 export function formatStatus(report: UsageReport): string {
@@ -290,7 +341,7 @@ export function sessionTokensForModel(entries: readonly unknown[], provider: str
 }
 
 export function formatReport(report: UsageReport, modelId: string, tokens: SessionTokens, now = Date.now()): string {
-	const name = report.upstream === "codex" ? "Codex" : "OpenCode Go";
+	const name = UPSTREAM_NAME[report.upstream];
 	const age = Math.round((now - report.observedAt) / 1000);
 	const lines = [
 		`${name} usage for ${modelId} (account-wide, ${report.source === "live" ? "live" : "last request"}, ${age < 60 ? "just now" : `${formatDuration(age)} ago`})`,
@@ -395,18 +446,28 @@ export default function (pi: ExtensionAPI) {
 		return upstreamForModel(model.id, await ownerOf(model.id));
 	}
 
-	async function codexCredential(): Promise<Json> {
+	async function credential(provider: "codex" | "claude"): Promise<Json> {
 		const files = asObject(await client!.request("/credentials"))?.files;
 		const accounts = (Array.isArray(files) ? files : [])
 			.map(asObject)
-			.filter((f): f is Json => !!f && (f.provider === "codex" || f.type === "codex") && f.disabled !== true);
-		if (accounts.length !== 1) throw new Error(`Expected one enabled Codex account, found ${accounts.length}`);
+			.filter((f): f is Json => !!f && (f.provider === provider || f.type === provider) && f.disabled !== true);
+		if (accounts.length !== 1) {
+			throw new Error(`Expected one enabled ${UPSTREAM_NAME[provider]} account, found ${accounts.length}`);
+		}
 		return accounts[0]!;
 	}
 
+	async function claudeReport(): Promise<UsageReport> {
+		const report = parseClaudeSignals((await credential("claude")).quota);
+		if (!report) throw new Error("No Claude usage recorded yet; it appears after a Claude request");
+		return report;
+	}
+
 	async function fetchLive(upstream: Upstream, modelId: string): Promise<UsageReport> {
+		// Claude has no live usage source; the proxy's recorded signals are the best data.
+		if (upstream === "claude") return claudeReport();
 		if (upstream === "codex") {
-			const account = await codexCredential();
+			const account = await credential("codex");
 			const authIndex = asString(account.auth_index);
 			if (!authIndex) throw new Error("Codex account has no auth_index");
 			const header: Record<string, string> = {
@@ -439,8 +500,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function fetchPassive(upstream: Upstream, modelId: string): Promise<UsageReport> {
+		if (upstream === "claude") return claudeReport();
 		if (upstream !== "codex") return fetchLive(upstream, modelId);
-		const report = parseCodexSignals((await codexCredential()).quota);
+		const report = parseCodexSignals((await credential("codex")).quota);
 		return report ?? fetchLive(upstream, modelId);
 	}
 
@@ -550,7 +612,10 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const report = await refresh(ctx, "live");
 				if (!report) {
-					ctx.ui.notify(`No supported usage source for ${model.id} (Codex and OpenCode Go only)`, "warning");
+					ctx.ui.notify(
+						`No supported usage source for ${model.id} (Codex, OpenCode Go and Claude only)`,
+						"warning",
+					);
 					return;
 				}
 				const tokens = sessionTokensForModel(ctx.sessionManager.getBranch(), model.provider, model.id);

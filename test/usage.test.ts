@@ -3,6 +3,7 @@ import {
 	findOpenCodeKey,
 	formatReport,
 	formatStatus,
+	parseClaudeSignals,
 	parseCodexSignals,
 	parseCodexUsage,
 	parseOpenCodeUsage,
@@ -27,7 +28,8 @@ describe("upstreamForModel", () => {
 	it("maps proxy owners to quota sources", () => {
 		expect(upstreamForModel("gpt-6.1-sol", "openai")).toBe("codex");
 		expect(upstreamForModel("opencode-go/glm-5.3", "opencode-go")).toBe("opencode-go");
-		expect(upstreamForModel("claude-opus-5-5", "anthropic")).toBeUndefined();
+		expect(upstreamForModel("claude-opus-5-5", "anthropic")).toBe("claude");
+		expect(upstreamForModel("gemini-3-pro", "google")).toBeUndefined();
 	});
 
 	it("falls back to the model prefix when the owner is unknown", () => {
@@ -109,6 +111,55 @@ describe("parseCodexSignals", () => {
 	it("returns undefined without signals", () => {
 		expect(parseCodexSignals({ signals: {} })).toBeUndefined();
 		expect(parseCodexSignals(undefined)).toBeUndefined();
+	});
+});
+
+describe("parseClaudeSignals", () => {
+	const signals = {
+		"Anthropic-Ratelimit-Unified-5h-Reset": "1794256200",
+		"Anthropic-Ratelimit-Unified-5h-Status": "allowed",
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.25",
+		"Anthropic-Ratelimit-Unified-7d-Reset": "1794520800",
+		"Anthropic-Ratelimit-Unified-7d-Status": "allowed",
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.08",
+		"Anthropic-Ratelimit-Unified-Overage-Disabled-Reason": "org_level_disabled",
+		"Anthropic-Ratelimit-Unified-Overage-Status": "rejected",
+	};
+
+	it("converts utilization fractions to percentages", () => {
+		const report = parseClaudeSignals({ observed_at: "2026-11-09T13:03:55.932382082-07:00", signals });
+		expect(report?.windows).toEqual([
+			{ label: "5h", usedPercent: 25, resetsAt: 1794256200 },
+			{ label: "wk", usedPercent: 8, resetsAt: 1794520800 },
+		]);
+		expect(report?.source).toBe("passive");
+		expect(report?.notes).toEqual([]);
+		expect(report && formatStatus(report)).toBe("claude 75% 5h · 92% wk");
+	});
+
+	it("notes limited windows and usable overage", () => {
+		const report = parseClaudeSignals({
+			signals: {
+				...signals,
+				"Anthropic-Ratelimit-Unified-5h-Status": "rejected",
+				"Anthropic-Ratelimit-Unified-Overage-Status": "allowed",
+			},
+		});
+		expect(report?.notes).toEqual(["5h window status: rejected", "Overage: allowed"]);
+	});
+
+	it("returns undefined before any Claude request was recorded", () => {
+		expect(parseClaudeSignals({ signals: {} })).toBeUndefined();
+		expect(parseClaudeSignals({ signals: { "X-Codex-Primary-Used-Percent": "20" } })).toBeUndefined();
+	});
+
+	it("formats the report as last-request data with its age", () => {
+		const observed = Date.parse("2026-11-09T20:00:00Z");
+		const report = parseClaudeSignals({ observed_at: "2026-11-09T20:00:00Z", signals });
+		const text =
+			report &&
+			formatReport(report, "claude-opus-5-5", sessionTokensForModel([], "cliproxyapi", "x"), observed + 600_000);
+		expect(text).toContain("Claude usage for claude-opus-5-5 (account-wide, last request, 10m ago)");
 	});
 });
 
