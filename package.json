@@ -36,7 +36,8 @@
 	"pi": {
 		"extensions": [
 			"./extensions/index.ts",
-			"./extensions/tps.ts"
+			"./extensions/tps.ts",
+			"./extensions/usage.ts"
 		]
 	},
 	"peerDependencies": {
